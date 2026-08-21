@@ -1,0 +1,20 @@
+# Phase 0-1: repo setup + hello world agent
+langchain>=0.3,<0.4
+langchain-google-genai>=2.0,<3.0
+python-dotenv>=1.0,<2.0
+
+# --- Add these when you reach the phase that needs them (see ROADMAP.md) ---
+
+# Phase 2: document loading & splitting
+# unstructured>=0.15
+# markdown>=3.6
+
+# Phase 3-4: embeddings, Chroma vector store, RAG
+# langchain-chroma>=0.1
+# chromadb>=0.5
+
+# Phase 5: multi-agent orchestration
+# langgraph>=0.2
+
+# Phase 6: observability
+# langsmith>=0.1
