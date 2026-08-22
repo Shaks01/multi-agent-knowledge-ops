@@ -109,6 +109,14 @@ def run(plan: List[str]) -> dict:
             output={
                 "sources": collect_sources(subtask_results),
                 "chunks_per_subtask": [len(r["chunks"]) for r in subtask_results],
+                # Relevance signal for each subtask's retrieval, so it's
+                # inspectable directly from this agent's own logged step
+                # rather than only in the Evaluation agent's summary
+                # (see agents/evaluation.py). Lower score == more similar
+                # for Chroma's default distance function.
+                "scores_per_subtask": [
+                    [chunk["score"] for chunk in r["chunks"]] for r in subtask_results
+                ],
             },
         ),
     }

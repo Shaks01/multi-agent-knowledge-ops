@@ -1,13 +1,12 @@
 """
-Phase 6: turn a logged run into a human-readable explanation.
+Phase 6+8: turn a logged run into a human-readable explanation.
 
 The Memory agent already writes every run's full step-by-step trace to
 logs/agent_trace.jsonl (see agents/memory.py). This module is what makes
 that raw JSONL actually *useful* to a person: it renders one run as a
-plain-text walkthrough of what each agent did, and runs a citation
-consistency check confirming every source cited in the final answer is
-something the Retrieval agent actually found for that run -- not
-something invented at the reasoning step.
+plain-text walkthrough of what each agent did, plus (Phase 8) the
+Evaluation agent's structured verdict on the run itself -- grounding,
+retrieval relevance, citation consistency, and any failures flagged.
 
 This is the concrete implementation of "the explanation aligns with the
 final response and source documents": it's not just an assertion, it's a
@@ -62,8 +61,17 @@ def _extract_citations(answer: str) -> List[str]:
     return [m.strip() for m in _CITATION_PATTERN.findall(answer)]
 
 
-def _filename(label: str) -> str:
-    """"Attendance Policy.pdf, p.2" -> "attendance policy.pdf" """
+def source_key(label: str) -> str:
+    """"Attendance Policy.pdf, p.2" -> "attendance policy.pdf"
+
+    Shared normalization used to compare a citation string against a
+    retrieved-source label -- matches on filename only (not exact page),
+    since an LLM's citation formatting can vary slightly even when it's
+    citing a real, retrieved document. Exported (not "_"-prefixed) because
+    the Evaluation agent (agents/evaluation.py) needs the exact same
+    normalization to run this same check live, during a query, not just
+    after the fact here.
+    """
     return label.split(",")[0].strip().lower()
 
 
@@ -72,27 +80,60 @@ def _retrieved_filenames(trace: List[dict]) -> Set[str]:
     for step in trace:
         if step.get("agent") == "retrieval":
             for label in step.get("output", {}).get("sources", []):
-                filenames.add(_filename(label))
+                filenames.add(source_key(label))
     return filenames
 
 
-def check_citation_consistency(record: dict) -> Dict:
-    """Compare sources cited inline in the answer against what Retrieval
-    actually returned for this run. Matches on filename only (not exact
-    page string), since an LLM's citation formatting can vary slightly
-    even when it's citing a real, retrieved document.
+def citation_consistency(answer: str, retrieved_filenames: Set[str]) -> Dict:
+    """Compare sources cited inline in `answer` against the set of
+    filenames actually retrieved. This is the low-level check both the
+    Evaluation agent (live, during a query -- agents/evaluation.py) and
+    `check_citation_consistency` below (after the fact, from a logged
+    record) run -- kept as one function so both places can never drift
+    apart on what "consistent" means.
     """
-    cited = _extract_citations(record.get("answer", ""))
-    retrieved = _retrieved_filenames(record.get("trace", []))
-
-    unmatched = [c for c in cited if _filename(c) not in retrieved]
+    cited = _extract_citations(answer)
+    unmatched = [c for c in cited if source_key(c) not in retrieved_filenames]
 
     return {
         "cited": cited,
-        "retrieved_filenames": sorted(retrieved),
+        "retrieved_filenames": sorted(retrieved_filenames),
         "unmatched": unmatched,
         "consistent": not unmatched,
     }
+
+
+def check_citation_consistency(record: dict) -> Dict:
+    """Recompute the citation check from a logged record's raw trace.
+
+    Runs recorded from Phase 8 onward already carry this same check
+    pre-computed in `record["evaluation"]["citation_check"]` (see
+    `build_explanation`, which prefers that when present). This function
+    stays for older log lines written before the Evaluation agent existed,
+    and as a standalone way to re-check any record without touching the
+    graph.
+    """
+    retrieved = _retrieved_filenames(record.get("trace", []))
+    return citation_consistency(record.get("answer", ""), retrieved)
+
+
+def _format_citation_check(check: Dict) -> List[str]:
+    lines = []
+    if not check["cited"]:
+        lines.append("No inline (Source: ...) citations found in the answer.")
+    elif check["consistent"]:
+        lines.append(
+            "OK: every cited source matches a document the retrieval agent "
+            "actually retrieved for this run."
+        )
+    else:
+        lines.append(
+            "WARNING: the following cited source(s) do not match anything "
+            "retrieved for this run -- possible hallucinated citation:"
+        )
+        for c in check["unmatched"]:
+            lines.append(f"  - {c}")
+    return lines
 
 
 def build_explanation(record: dict) -> str:
@@ -120,21 +161,54 @@ def build_explanation(record: dict) -> str:
     lines.append(f"Flagged low-confidence: {record.get('flagged_low_confidence', False)}")
     lines.append("")
 
-    lines.append("--- Citation consistency check ---")
-    check = check_citation_consistency(record)
-    if not check["cited"]:
-        lines.append("No inline (Source: ...) citations found in the answer.")
-    elif check["consistent"]:
+    lines.append("--- Evaluation ---")
+    evaluation = record.get("evaluation")
+    if record.get("blocked_by_input_guard"):
         lines.append(
-            "OK: every cited source matches a document the retrieval agent "
-            "actually retrieved for this run."
+            "N/A -- the question was blocked by the input guard before "
+            "anything was generated, so there's nothing to evaluate."
         )
+    elif evaluation is None:
+        # A run logged before the Evaluation agent existed (Phase 8) --
+        # fall back to recomputing just the citation check from the raw
+        # trace, rather than showing nothing.
+        lines.append(
+            "(older run, predates the Evaluation agent -- recomputing "
+            "citation check only)"
+        )
+        lines.extend(_format_citation_check(check_citation_consistency(record)))
     else:
+        failures = evaluation.get("failures", [])
         lines.append(
-            "WARNING: the following cited source(s) do not match anything "
-            "retrieved for this run -- possible hallucinated citation:"
+            f"Failures flagged: {', '.join(failures) if failures else 'none'}"
         )
-        for c in check["unmatched"]:
-            lines.append(f"  - {c}")
+        grounding = evaluation.get("grounding", {})
+        lines.append(
+            f"Grounding: approved={grounding.get('approved')} "
+            f"confidence={grounding.get('confidence')}"
+        )
+        if grounding.get("issues"):
+            for issue in grounding["issues"]:
+                lines.append(f"  unsupported claim: {issue}")
+
+        retrieval_eval = evaluation.get("retrieval", {})
+        for s in retrieval_eval.get("per_subtask", []):
+            best = s.get("best_score")
+            best_str = f"{best:.4f}" if isinstance(best, (int, float)) else "n/a"
+            lines.append(
+                f"Retrieval: {s.get('chunk_count')} chunk(s), best score "
+                f"{best_str} -- {s.get('subtask')!r}"
+            )
+        if retrieval_eval.get("insufficient_subtasks"):
+            lines.append(
+                f"  insufficient retrieval for: "
+                f"{retrieval_eval['insufficient_subtasks']}"
+            )
+        if retrieval_eval.get("weak_relevance_subtasks"):
+            lines.append(
+                f"  weak relevance for: {retrieval_eval['weak_relevance_subtasks']}"
+            )
+
+        lines.extend(_format_citation_check(evaluation.get("citation_check", {})))
 
     return "\n".join(lines)

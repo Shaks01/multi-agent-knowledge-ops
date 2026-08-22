@@ -18,6 +18,9 @@ all handled here so no other agent needs to know about any of them:
    past interaction can be inspected later without having had the
    terminal output open at the time (see run_explain.py). This is what
    satisfies "agent interactions are traceable and logged for inspection."
+   The Evaluation agent's structured verdict (agents/evaluation.py) is
+   persisted here too, under `record["evaluation"]`, so evaluation output
+   is inspectable the same way -- not a side channel only visible live.
 
 3. Grounding/confidence warning -- by the time this agent runs, the
    Validator -> Reasoning retry loop (graph.py) is over, one way or
@@ -100,6 +103,7 @@ def run(
     conversation_history: List[dict],
     validation: Optional[dict] = None,
     guard: Optional[dict] = None,
+    evaluation: Optional[dict] = None,
 ) -> dict:
     blocked = bool(guard) and not guard.get("allowed", True)
 
@@ -122,6 +126,9 @@ def run(
         "flagged_low_confidence": was_flagged,
         "sources": sources,
         "trace": trace,
+        # None for a blocked question (the Evaluation agent never ran --
+        # see graph.py) or for a run logged before Phase 8.
+        "evaluation": evaluation if not blocked else None,
     }
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -136,6 +143,11 @@ def run(
         print(f"--- {AGENT_NAME} agent: question was blocked, not answered ---")
     elif was_flagged:
         print(f"--- {AGENT_NAME} agent: flagged answer as low-confidence ---")
+    if evaluation and evaluation.get("failures"):
+        print(
+            f"--- {AGENT_NAME} agent: evaluation flagged: "
+            f"{', '.join(evaluation['failures'])} ---"
+        )
     print(f"--- {AGENT_NAME} agent: logged run {run_id} to {TRACE_LOG_PATH} ---\n")
 
     return {

@@ -1,13 +1,14 @@
 """
-Entry point for Phase 5+6+7: ask a complex, possibly multi-document
-question and get back an answer produced by six distinct agents -- an
-input guard, planning, retrieval, reasoning, validation, and memory (see
-src/knowledge_ops/agents/ and orchestration/graph.py).
+Entry point for Phase 5+6+7+8: ask a complex, possibly multi-document
+question and get back an answer produced by seven distinct agents -- an
+input guard, planning, retrieval, reasoning, validation, evaluation, and
+memory (see src/knowledge_ops/agents/ and orchestration/graph.py).
 
 Every step prints what it did: whether the input guard allowed the
-question, the plan, what was retrieved per subtask, the draft answer, the
-validation verdict and confidence (and a revised draft if it was
-rejected), and finally where the full trace was logged for later
+question, the plan, what was retrieved per subtask (with relevance
+scores), the draft answer, the validation verdict and confidence (and a
+revised draft if it was rejected), the evaluation agent's failure-flag
+summary, and finally where the full trace was logged for later
 inspection. Multi-turn memory works within one run of this script --
 follow-up questions can reference earlier ones in the same session.
 
@@ -47,7 +48,22 @@ def _print_result(result: dict) -> None:
             f"\n(Reasoning agent revised this answer "
             f"{result['revision_count']} time(s) after validation feedback.)"
         )
-    print("\n(Run `python run_explain.py` to see the full agent-by-agent trace for this run.)")
+
+    evaluation = result.get("evaluation")
+    if evaluation:
+        failures = evaluation.get("failures", [])
+        print("\nEvaluation summary:")
+        print(f"  failures flagged: {', '.join(failures) if failures else 'none'}")
+        grounding = evaluation.get("grounding", {})
+        print(
+            f"  grounding: approved={grounding.get('approved')} "
+            f"confidence={grounding.get('confidence')}"
+        )
+        citation_check = evaluation.get("citation_check", {})
+        if citation_check.get("cited") and not citation_check.get("consistent"):
+            print(f"  unmatched citation(s): {citation_check['unmatched']}")
+
+    print("\n(Run `python run_explain.py` to see the full agent-by-agent trace and evaluation detail for this run.)")
     print()
 
 

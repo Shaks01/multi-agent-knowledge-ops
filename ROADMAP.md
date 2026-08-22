@@ -21,7 +21,7 @@ only once its code runs and its output has been looked at, not just written.
 
 ## Phase 2 — Load and chunk documents (this commit)
 
-- Source documents live in `src/knowledge_ops/data/documents/` (currently 5
+- Source documents live in `src/knowledge_ops/data/documents/` (currently 6
   sample company policy PDFs). Loader is dispatched by file extension
   (`src/knowledge_ops/ingestion/loaders.py`) so new types (`.docx`, more
   `.pdf`s, etc.) can be added without touching the ingestion script.
@@ -149,6 +149,62 @@ Deliberately not yet doing: semantic/LLM-based content moderation (only
 pattern-based), automatic escalation to a human for low-confidence
 answers, or hard-blocking (vs. warning on) ungrounded answers -- see
 `config.py` and the agents above for where each of those would plug in.
+
+## Phase 8 — Evaluation, observability & failure detection (this commit)
+
+Feature: **Evaluation, Observability, and Failure Detection** — explicit,
+structured evaluation of each run's own behavior, separate from whether
+the answer itself reads as grounded.
+
+- **Evaluation agent** (`agents/evaluation.py`) — new node in the graph,
+  `validator -> evaluator -> memory`, running once the Validation <->
+  Reasoning retry loop has settled (skipped for a question the Input
+  Guard blocked -- nothing was generated to evaluate). Rule-based, like
+  the Input Guard agent: no LLM call, so every flag traces to an exact
+  rule.
+- **Retrieval relevance signals** — every chunk's similarity score is now
+  captured in both the Retrieval agent's own trace output
+  (`scores_per_subtask`) and the Evaluation agent's summary, not just
+  printed to the console and discarded.
+- **Failure detection** — the Evaluation agent flags, per run:
+  `insufficient_retrieval` (a subtask returned zero chunks --
+  `config.MIN_CHUNKS_PER_SUBTASK`), `weak_retrieval_relevance` (opt-in via
+  `config.RELEVANCE_DISTANCE_THRESHOLD`, unset by default -- see the
+  comment in `config.py` for why no default distance value is safe to
+  assume), `low_grounding_confidence` and `answer_rejected` (carried over
+  from Validation's verdict), and `conflicting_agent_outputs` -- the one
+  new *cross-agent* check: Validation approved the answer, but the
+  citation-consistency check independently found a citation that was
+  never retrieved. That specific, structurally-detectable disagreement is
+  what "conflicting agent outputs" means here; broader semantic
+  contradiction-checking between agents (e.g. two subtask answers that
+  logically conflict) is not implemented.
+- **Structured, inspectable logging** — the full evaluation record
+  (grounding, per-subtask retrieval detail, the citation check, and the
+  failures list) is persisted under `record["evaluation"]` in
+  `logs/agent_trace.jsonl` for every run, alongside the existing trace.
+  `run_explain.py` renders it as an "Evaluation" section, falling back to
+  recomputing just the citation check for older log lines that predate
+  this agent.
+- **Alongside the final response** — `run_query.py` prints an "Evaluation
+  summary" (failures flagged, grounding, any unmatched citations)
+  immediately under every answer, not only in the after-the-fact report.
+
+One real bug this surfaced during testing, fixed as part of this phase:
+the Reasoning agent only counted a Validation-triggered retry as a
+"revision" if the verdict listed specific unsupported claims. A
+low-confidence-but-approved verdict with no listed claims never
+incremented `revision_count`, so `config.MAX_REVISIONS` didn't actually
+bound that retry path -- it could loop forever. Fixed in
+`agents/reasoning.py` so any call made because a prior validation verdict
+exists counts as a revision, regardless of whether it named a specific
+claim.
+
+What's still open: no automated evaluation *scoring* across many runs at
+once (this is per-run only -- see "browse/search many past runs" under
+Phase 6), and `conflicting_agent_outputs` covers exactly one specific
+disagreement, not general contradiction detection across agents or
+subtasks.
 
 ## Ground rules for every phase
 

@@ -84,6 +84,28 @@ MAX_QUESTION_LENGTH = int(os.environ.get("MAX_QUESTION_LENGTH", "2000"))
 # clearly shaky ones aren't.
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.7"))
 
+# --- Evaluation & failure detection (Phase 8) ---------------------------
+
+# Evaluation agent: a subtask is flagged "insufficient_retrieval" if it
+# comes back with fewer than this many chunks (0, by default -- a subtask
+# that finds nothing at all is the one case we can flag with total
+# confidence, regardless of the embedding space).
+MIN_CHUNKS_PER_SUBTASK = int(os.environ.get("MIN_CHUNKS_PER_SUBTASK", "1"))
+
+# Evaluation agent: an optional distance ceiling above which a retrieved
+# chunk is considered "not actually relevant." Left unset by default --
+# unlike MIN_CHUNKS_PER_SUBTASK, there's no safe universal default here:
+# what counts as a "good" distance score depends on the embedding model
+# and Chroma's distance function, and hasn't been empirically tuned for
+# this project's real Gemini embeddings. Inspect real scores with
+# `python run_search_demo.py` first, then set this via the
+# RELEVANCE_DISTANCE_THRESHOLD env var if you want the extra check --
+# leaving it unset means only the always-safe zero-chunks check runs.
+_relevance_threshold_raw = os.environ.get("RELEVANCE_DISTANCE_THRESHOLD")
+RELEVANCE_DISTANCE_THRESHOLD = (
+    float(_relevance_threshold_raw) if _relevance_threshold_raw else None
+)
+
 
 def _require_api_key() -> str:
     api_key = os.environ.get("GOOGLE_API_KEY")

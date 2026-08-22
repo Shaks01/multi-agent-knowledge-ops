@@ -38,6 +38,16 @@ The Validation agent now rates its confidence (not just approved/
 rejected), and a low-confidence or unapproved answer gets a visible
 warning; every answer gets a standing source-attribution disclaimer.
 
+**Phase 8: Evaluation, observability & failure detection.** A new
+Evaluation agent runs after every answer, independent of Validation: it
+captures retrieval relevance scores per subtask, re-checks citation
+consistency, and flags specific failure conditions (insufficient
+retrieval, weak relevance, low grounding confidence, an outright
+rejection, or Validation and the citation check disagreeing with each
+other). The result is a structured evaluation record shown live in
+`run_query.py`'s output, persisted in `logs/agent_trace.jsonl`, and
+rendered by `run_explain.py`.
+
 ## Setup
 
 1. **Create a virtual environment** (run this on your own machine, not
@@ -84,7 +94,7 @@ is a goal of this project from day one, not something bolted on later.
 ## Ingest documents into the vector store
 
 Drop source documents (currently `.pdf`, `.txt`, `.md` are supported) into
-`src/knowledge_ops/data/documents/` — 5 sample company policy PDFs are
+`src/knowledge_ops/data/documents/` — 6 sample company policy PDFs are
 already there — then run:
 
 ```
@@ -158,10 +168,42 @@ python run_explain.py <run_id>       # a specific run (run_id is printed
 ```
 
 Renders one run as a plain-text walkthrough: what each agent did, the
-final answer, its sources, and a **citation consistency check** — every
-`(Source: ...)` cited in the answer is checked against what the Retrieval
-agent actually found for that run. If the Reasoning agent ever cites a
-document that was never retrieved, this is what catches it.
+final answer, its sources, and an **Evaluation** section (see below) —
+grounding, retrieval relevance, the citation consistency check, and any
+failures flagged for that run.
+
+## Evaluation & failure detection
+
+After every answer (blocked questions excepted — nothing was generated to
+evaluate), a dedicated Evaluation agent (`agents/evaluation.py`) runs a
+second, independent pass over that same run and reports:
+
+- **Grounding** — the Validation agent's approved/rejected verdict and
+  confidence, carried into one place alongside the checks below.
+- **Retrieval relevance** — the similarity score Chroma returned for
+  every chunk used to answer, per subtask. A subtask that comes back with
+  zero chunks is flagged `insufficient_retrieval`
+  (`config.MIN_CHUNKS_PER_SUBTASK`). An optional, unset-by-default
+  distance ceiling (`config.RELEVANCE_DISTANCE_THRESHOLD`) additionally
+  flags `weak_retrieval_relevance` if you set it — see the comment in
+  `config.py` for why there's no safe default value to ship here.
+- **Citation consistency** — the same check `run_explain.py` always ran,
+  now also computed live during the query itself, not just after the
+  fact.
+- **Conflicting agent outputs** — if Validation approves the answer but
+  the citation check independently finds a citation that was never
+  retrieved, that disagreement between two checks is flagged as
+  `conflicting_agent_outputs`. Neither check is "wrong" on its own; the
+  point is that they shouldn't disagree, and when they do, that's worth
+  seeing rather than silently trusting whichever one ran last.
+
+The result — a `failures` list plus the full detail behind it — is
+printed right after the answer in `run_query.py`, saved into
+`logs/agent_trace.jsonl` under `evaluation` for every run, and rendered
+by `run_explain.py`. It doesn't change what's shown to the user (that's
+still `agents/memory.py`'s job — the grounding warning and disclaimer);
+it's a separate, structured judgment on the run's own reliability that
+sits alongside the answer, for whoever wants to check the system's work.
 
 ## Guardrails
 
@@ -209,21 +251,53 @@ before it's shown:
     │   ├── retrieval.py          Retrieval agent: subtasks -> Chroma chunks
     │   ├── reasoning.py          Reasoning agent: chunks -> cited draft answer
     │   ├── validation.py         Validation agent: draft -> grounding verdict + confidence
+    │   ├── evaluation.py         Evaluation agent: failure detection + observability (Phase 8)
     │   └── memory.py             Memory agent: session history, trace log, warnings/disclaimer
     ├── ingestion/
     │   ├── loaders.py            file-extension -> LangChain loader dispatch
     │   └── ingest.py             load -> split -> embed -> persist to Chroma
     ├── orchestration/
-    │   └── graph.py              wires the 6 agents into a LangGraph graph
+    │   └── graph.py              wires the 7 agents into a LangGraph graph
     ├── explainability/
-    │   └── report.py             Phase 6: renders a run + checks citation consistency
+    │   └── report.py             Phase 6+8: renders a run + evaluation summary
     └── data/documents/           source documents (sample company policy PDFs)
 logs/
 └── agent_trace.jsonl             one JSON record per run (git-ignored, local history)
+tests/
+└── test_*.py, fakes.py           unit tests -- see "Running the tests" below
 ```
 
 Every later phase (observability, governance) builds on this same
 `src/knowledge_ops/` package — see `ROADMAP.md` for what's next.
+
+## Running the tests
+
+```
+python -m unittest discover -v
+```
+
+Run from the repo root (no `pip install` needed beyond what Setup above
+already has you install -- the suite uses only Python's built-in
+`unittest`/`unittest.mock`, nothing new). Every LLM call, vector-store
+call, and disk write an agent would normally make is replaced with a
+fake object or a temp directory (see `tests/fakes.py`), so the whole
+suite runs in well under a second, needs no `GOOGLE_API_KEY`, and never
+touches `logs/` or `chroma_db/` -- these are unit tests of each agent's
+own logic, not integration tests against a real LLM (that's what
+actually running `run_query.py` is for).
+
+Two test modules (`test_graph_integration.py`, needing the real
+`langgraph` package to check the graph's node wiring; `test_hello_agent.py`,
+needing `langchain_core` for its message classes) skip themselves with a
+clear reason if those packages aren't installed. Both are already in
+`requirements.txt`, so on a normal setup they run for real rather than
+skipping -- the skip only protects a partial environment (e.g. before
+`pip install -r requirements.txt` has been run) from showing as a
+failure.
+
+If you have `pytest` installed, `pytest tests/` also works and discovers
+the exact same tests (pytest runs plain `unittest.TestCase` suites
+natively) -- it's not required, just an alternative runner.
 
 ## Why Gemini for the LLM
 

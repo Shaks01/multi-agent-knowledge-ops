@@ -1,8 +1,8 @@
 """
-Phase 5+6+7: the multi-agent orchestrator, now with a guardrail entry
-point.
+Phase 5+6+7+8: the multi-agent orchestrator, now with a guardrail entry
+point and an evaluation/observability stage.
 
-Wires six distinct agents (src/knowledge_ops/agents/) into a LangGraph
+Wires seven distinct agents (src/knowledge_ops/agents/) into a LangGraph
 graph, each with one clearly scoped job:
 
   input_guard -> rule-based safety/sanity check, before anything else runs
@@ -11,22 +11,30 @@ graph, each with one clearly scoped job:
   reasoning   -> drafts a coherent, cited answer from that context
   validation  -> checks the draft is grounded in that context, with a
                  confidence score
-  memory      -> persists the run's full trace, updates conversation
-                 history, and applies warnings/disclaimers to the answer
+  evaluation  -> runs failure-detection checks over this run's own
+                 behavior (retrieval relevance, citation consistency,
+                 grounding vs. citation-check agreement) once validation
+                 has settled
+  memory      -> persists the run's full trace (including the evaluation
+                 record), updates conversation history, and applies
+                 warnings/disclaimers to the answer
 
 Graph shape:
 
-    START -> input_guard --(blocked)-------------------+
-                 |                                      |
-              (allowed)                                 |
-                 v                                       v
-              planner -> retrieval -> reasoning -> validator --+
-                                          ^                    |
-                                          | (rejected or       | (approved &
-                                          |  low confidence,   |  confident, or
-                                          |  retry)            |  retry cap hit)
-                                          +--------------------+
-                                                               v
+    START -> input_guard --(blocked)-----------------------------+
+                 |                                                |
+              (allowed)                                           |
+                 v                                                 v
+              planner -> retrieval -> reasoning -> validator --+   |
+                                          ^                    |   |
+                                          | (rejected or       |   |
+                                          |  low confidence,   | (approved &
+                                          |  retry)            |  confident, or
+                                          +--------------------+  retry cap hit)
+                                                                v  |
+                                                            evaluator
+                                                                |
+                                                                v
                                                              memory -> END
 
 (Node is named "validator", not "validation" -- LangGraph doesn't allow a
@@ -36,21 +44,23 @@ already the state field holding the verdict dict.)
 The validator -> reasoning edge is a bounded retry (see
 config.MAX_REVISIONS): if the validator finds unsupported claims OR its
 confidence is below config.CONFIDENCE_THRESHOLD, the Reasoning agent gets
-one more attempt with that specific feedback before the answer is
-returned regardless, so a genuinely unanswerable question can't loop
+one more attempt with that specific feedback before the answer moves on
+to evaluation regardless, so a genuinely unanswerable question can't loop
 forever. The Memory agent applies a visible warning in that case (or if
 the retry cap was hit before the Validation agent was satisfied) -- see
 agents/memory.py.
 
 A question the Input Guard agent blocks skips planner/retrieval/
-reasoning/validator entirely and goes straight to Memory, which logs the
-rejection and returns its reason as the answer, unchanged.
+reasoning/validator/evaluator entirely and goes straight to Memory, which
+logs the rejection and returns its reason as the answer, unchanged --
+there's nothing generated to evaluate in that case.
 """
 
 import operator
 from typing import Annotated, List, Optional, TypedDict
 
 from knowledge_ops.agents import (
+    evaluation,
     input_guard,
     memory,
     planner,
@@ -71,6 +81,7 @@ class AgentState(TypedDict):
     draft_answer: str
     validation: dict
     revision_count: int
+    evaluation: dict
     answer: str
     sources: List[str]
     # Additive: every agent appends its own step(s) rather than overwriting
@@ -114,6 +125,16 @@ def _validation_node(state: AgentState) -> dict:
     )
 
 
+def _evaluator_node(state: AgentState) -> dict:
+    return evaluation.run(
+        question=state["question"],
+        draft_answer=state["draft_answer"],
+        subtask_results=state["subtask_results"],
+        validation=state.get("validation"),
+        revision_count=state.get("revision_count", 0),
+    )
+
+
 def _memory_node(state: AgentState) -> dict:
     return memory.run(
         question=state["question"],
@@ -123,6 +144,7 @@ def _memory_node(state: AgentState) -> dict:
         conversation_history=state.get("conversation_history", []),
         validation=state.get("validation"),
         guard=state.get("guard"),
+        evaluation=state.get("evaluation"),
     )
 
 
@@ -137,7 +159,7 @@ def _route_after_validation(state: AgentState) -> str:
     low_confidence = verdict.get("confidence", 1.0) < CONFIDENCE_THRESHOLD
     if (rejected or low_confidence) and state.get("revision_count", 0) < MAX_REVISIONS:
         return "reasoning"
-    return "memory"
+    return "evaluator"
 
 
 # --- Graph assembly ------------------------------------------------------
@@ -154,7 +176,9 @@ def build_graph():
     # Named "validator", not "validation" -- that name is taken by the
     # `validation` state field (the verdict dict), and LangGraph raises
     # "'validation' is already being used as a state key" if a node reuses it.
+    # Same reasoning applies to "evaluator" below vs. the `evaluation` field.
     builder.add_node("validator", _validation_node)
+    builder.add_node("evaluator", _evaluator_node)
     builder.add_node("memory", _memory_node)
 
     builder.add_edge(START, "input_guard")
@@ -165,8 +189,11 @@ def build_graph():
     builder.add_edge("retrieval", "reasoning")
     builder.add_edge("reasoning", "validator")
     builder.add_conditional_edges(
-        "validator", _route_after_validation, {"reasoning": "reasoning", "memory": "memory"}
+        "validator",
+        _route_after_validation,
+        {"reasoning": "reasoning", "evaluator": "evaluator"},
     )
+    builder.add_edge("evaluator", "memory")
     builder.add_edge("memory", END)
 
     return builder.compile()
@@ -193,6 +220,7 @@ def answer_question(
             "draft_answer": "",
             "validation": {},
             "revision_count": 0,
+            "evaluation": {},
             "answer": "",
             "sources": [],
             "trace": [],
