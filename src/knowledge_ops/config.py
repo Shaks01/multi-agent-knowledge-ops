@@ -57,6 +57,20 @@ TOP_K_PER_SUBTASK = int(os.environ.get("TOP_K_PER_SUBTASK", "4"))
 # question from fanning out into dozens of retrieval calls.
 MAX_SUBTASKS = int(os.environ.get("MAX_SUBTASKS", "5"))
 
+# --- Multi-agent architecture (Phase 5) ---------------------------------
+
+# How many times the Reasoning agent may retry after a Validation agent
+# rejection, per question. Bounded so an answer that can never satisfy
+# validation (e.g. the documents genuinely don't cover it) doesn't loop
+# forever -- after this many retries the last draft is returned as-is,
+# with the validation verdict still logged to the trace either way.
+MAX_REVISIONS = int(os.environ.get("MAX_REVISIONS", "1"))
+
+# Where the Memory agent persists the audit trail of every run
+# (logs/agent_trace.jsonl). Git-ignored -- it's local operational history,
+# not project source.
+LOGS_DIR = PROJECT_ROOT / "logs"
+
 
 def _require_api_key() -> str:
     api_key = os.environ.get("GOOGLE_API_KEY")

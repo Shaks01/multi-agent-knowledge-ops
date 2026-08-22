@@ -1,13 +1,14 @@
 """
-Entry point for Phase 4+5: ask a complex, possibly multi-document question
-and get back an orchestrated, cited answer.
+Entry point for Phase 5: ask a complex, possibly multi-document question
+and get back an answer produced by five distinct agents -- planning,
+retrieval, reasoning, validation, and memory (see
+src/knowledge_ops/agents/ and orchestration/graph.py).
 
-The orchestrator (src/knowledge_ops/orchestration/graph.py) breaks the
-question into subtasks, retrieves relevant chunks per subtask from the
-Chroma store built by run_ingest.py, and synthesizes one coherent answer.
-Every step prints what it did -- the subtask breakdown, what was retrieved
-for each one, and the sources behind the final answer -- so nothing about
-how the answer was produced is hidden.
+Every step prints what it did: the plan, what was retrieved per subtask,
+the draft answer, the validation verdict (and a revised draft if it was
+rejected), and finally where the full trace was logged for later
+inspection. Multi-turn memory works within one run of this script --
+follow-up questions can reference earlier ones in the same session.
 
 Usage:
     python run_query.py
@@ -31,6 +32,11 @@ def _print_result(result: dict) -> None:
         print("\nSources:")
         for source in result["sources"]:
             print(f"  - {source}")
+    if result.get("revision_count", 0) > 0:
+        print(
+            f"\n(Reasoning agent revised this answer "
+            f"{result['revision_count']} time(s) after validation feedback.)"
+        )
     print()
 
 
@@ -41,13 +47,15 @@ def main() -> None:
         _print_result(result)
         return
 
-    print("Complex query demo. Type a question, or 'exit'/'quit' to stop.\n")
+    print("Multi-agent query demo. Type a question, or 'exit'/'quit' to stop.\n")
     print(
         "Try one that spans more than one document, e.g.: "
         "\"If an employee is accused of violating the non-disclosure policy "
         "during a dispute, does that go through arbitration, and could "
         "their attendance record also affect any disciplinary action?\"\n"
     )
+
+    conversation_history = []
     while True:
         try:
             question = input("Question: ").strip()
@@ -61,8 +69,9 @@ def main() -> None:
             print("Goodbye.")
             break
 
-        result = answer_question(question)
+        result = answer_question(question, conversation_history=conversation_history)
         _print_result(result)
+        conversation_history = result["conversation_history"]
 
 
 if __name__ == "__main__":

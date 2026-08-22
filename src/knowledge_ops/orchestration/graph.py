@@ -1,232 +1,157 @@
 """
-Phase 4+5: the orchestrator agent for complex, multi-document queries.
+Phase 5: the multi-agent orchestrator.
 
-Implements the "Complex Query Handling" story: a question that may need
-reasoning across more than one document is decomposed into subtasks, each
-subtask is answered by retrieving from the Chroma store built in Phase 3,
-and a final node synthesizes everything into one coherent, cited answer.
+Wires five distinct agents (src/knowledge_ops/agents/) into a LangGraph
+graph, each with one clearly scoped job:
 
-This is intentionally a straight-line graph (decompose -> retrieve ->
-synthesize), not a looping/self-correcting agent -- that's the smallest
-version of "orchestrator" that satisfies the acceptance criteria. Natural
-next steps once this is proven out: fan the retrieve step out in parallel
-per subtask (LangGraph's Send API), add a router node that skips
-decomposition entirely for obviously-simple questions, or add a critique
-node that checks the answer against the retrieved context before
-returning it (ties into Phase 6/7's transparency and governance goals).
+  planner    -> decides the sequence of subtasks needed (routing/planning)
+  retrieval  -> fetches context per subtask from Chroma
+  reasoning  -> drafts a coherent, cited answer from that context
+  validation -> checks the draft is actually grounded in that context
+  memory     -> persists the run's full trace and updates conversation history
+
+Graph shape:
+
+    START -> planner -> retrieval -> reasoning -> validator --+
+                                          ^                    |
+                                          | (rejected, retry)  | (approved, or
+                                          +--------------------+  retry cap hit)
+                                                               v
+                                                             memory -> END
+
+(Node is named "validator", not "validation" -- LangGraph doesn't allow a
+node name that collides with a state field name, and `validation` is
+already the state field holding the verdict dict.)
+
+The validator -> reasoning edge is a bounded retry (see
+config.MAX_REVISIONS): if the validator finds unsupported claims, the
+Reasoning agent gets one more attempt with that specific feedback before
+the answer is returned regardless, so a genuinely unanswerable question
+can't loop forever.
 """
 
-from typing import List, TypedDict
+import operator
+from typing import Annotated, List, Optional, TypedDict
 
-from pydantic import BaseModel, Field
-
-from knowledge_ops.config import (
-    CHROMA_COLLECTION_NAME,
-    CHROMA_PERSIST_DIR,
-    MAX_SUBTASKS,
-    TOP_K_PER_SUBTASK,
-    get_embeddings,
-    get_llm,
-)
+from knowledge_ops.agents import memory, planner, reasoning, retrieval, validation
+from knowledge_ops.agents.retrieval import SubtaskResult
+from knowledge_ops.config import MAX_REVISIONS
 
 
-# --- State ----------------------------------------------------------------
-
-
-class RetrievedChunk(TypedDict):
-    text: str
-    source: str
-    page: int | None
-    score: float
-
-
-class SubtaskResult(TypedDict):
-    subtask: str
-    chunks: List[RetrievedChunk]
-
-
-class QueryState(TypedDict):
+class AgentState(TypedDict):
     question: str
-    subtasks: List[str]
+    conversation_history: List[dict]
+    plan: List[str]
     subtask_results: List[SubtaskResult]
+    draft_answer: str
+    validation: dict
+    revision_count: int
     answer: str
     sources: List[str]
+    # Additive: every agent appends its own step(s) rather than overwriting
+    # what earlier agents already logged (see agents/trace.py).
+    trace: Annotated[List[dict], operator.add]
 
 
-# --- Structured output for the decomposition step --------------------------
+# --- Node wrappers -----------------------------------------------------
+# Thin adapters between LangGraph's "one dict argument" node signature and
+# each agent's own plain-argument function signature (kept plain so each
+# agent module is usable/testable on its own, without a graph involved).
 
 
-class SubtaskList(BaseModel):
-    """The set of self-contained sub-questions needed to fully answer the
-    original question. If the original question is already simple and
-    single-topic, this should just contain that one question unchanged."""
+def _planner_node(state: AgentState) -> dict:
+    return planner.run(state["question"], state.get("conversation_history"))
 
-    subtasks: List[str] = Field(
-        description=(
-            "1 to 5 self-contained sub-questions. Each should be answerable "
-            "on its own by searching a document library, and together they "
-            "should cover everything needed to answer the original question."
-        )
+
+def _retrieval_node(state: AgentState) -> dict:
+    return retrieval.run(state["plan"])
+
+
+def _reasoning_node(state: AgentState) -> dict:
+    return reasoning.run(
+        question=state["question"],
+        subtask_results=state["subtask_results"],
+        conversation_history=state.get("conversation_history"),
+        validation_feedback=state.get("validation"),
+        revision_count=state.get("revision_count", 0),
     )
 
 
-DECOMPOSE_SYSTEM_PROMPT = """You are the orchestrator for a company knowledge \
-base agent. Break the user's question into a small number of self-contained \
-sub-questions that, together, cover everything needed to answer it fully.
-
-Rules:
-- If the question is already simple and about one topic, return it as the \
-only subtask, unchanged.
-- Only split when the question genuinely spans more than one topic/policy \
-(e.g. it asks about two different procedures, or how two different \
-policies interact).
-- Each subtask must make sense on its own, without seeing the others.
-- Do not invent sub-questions the user didn't ask about."""
-
-
-SYNTHESIZE_SYSTEM_PROMPT = """You are a company knowledge-base assistant. \
-Answer the user's question using ONLY the provided context excerpts -- do \
-not use outside knowledge and do not guess.
-
-Rules:
-- Write one coherent answer to the ORIGINAL question, not a list of \
-separate answers to each subtask.
-- Cite the source for every claim inline, like (Source: Attendance \
-Policy.pdf, p.2).
-- If the context doesn't fully cover some part of the question, say so \
-explicitly instead of filling the gap with a guess.
-- Be concise. Do not repeat the question back before answering."""
-
-
-# --- Nodes ------------------------------------------------------------------
-
-
-def decompose(state: QueryState) -> dict:
-    llm = get_llm().with_structured_output(SubtaskList)
-    result: SubtaskList = llm.invoke(
-        [
-            {"role": "system", "content": DECOMPOSE_SYSTEM_PROMPT},
-            {"role": "user", "content": state["question"]},
-        ]
+def _validation_node(state: AgentState) -> dict:
+    return validation.run(
+        question=state["question"],
+        draft_answer=state["draft_answer"],
+        subtask_results=state["subtask_results"],
     )
 
-    subtasks = [s.strip() for s in result.subtasks if s.strip()][:MAX_SUBTASKS]
-    if not subtasks:
-        subtasks = [state["question"]]
 
-    print("--- orchestrator: decomposed into subtasks ---")
-    for i, subtask in enumerate(subtasks, start=1):
-        print(f"  {i}. {subtask}")
-    print()
-
-    return {"subtasks": subtasks}
-
-
-def retrieve(state: QueryState) -> dict:
-    from langchain_chroma import Chroma
-
-    if not CHROMA_PERSIST_DIR.exists():
-        raise FileNotFoundError(
-            f"No vector store found at {CHROMA_PERSIST_DIR}. "
-            "Run `python run_ingest.py` first."
-        )
-
-    vector_store = Chroma(
-        collection_name=CHROMA_COLLECTION_NAME,
-        embedding_function=get_embeddings(),
-        persist_directory=str(CHROMA_PERSIST_DIR),
+def _memory_node(state: AgentState) -> dict:
+    return memory.run(
+        question=state["question"],
+        answer=state["draft_answer"],
+        sources=state["sources"],
+        trace=state["trace"],
+        conversation_history=state.get("conversation_history", []),
     )
 
-    print("--- orchestrator: retrieving per subtask ---")
-    subtask_results: List[SubtaskResult] = []
-    for subtask in state["subtasks"]:
-        hits = vector_store.similarity_search_with_score(
-            subtask, k=TOP_K_PER_SUBTASK
-        )
-        chunks: List[RetrievedChunk] = [
-            {
-                "text": doc.page_content,
-                "source": doc.metadata.get("source", "unknown"),
-                "page": doc.metadata.get("page"),
-                "score": score,
-            }
-            for doc, score in hits
-        ]
-        subtask_results.append({"subtask": subtask, "chunks": chunks})
 
-        print(f"  subtask: {subtask!r}")
-        for chunk in chunks:
-            page_label = f", p.{chunk['page'] + 1}" if chunk["page"] is not None else ""
-            print(f"    - {chunk['source']}{page_label} (score={chunk['score']:.4f})")
-    print()
-
-    return {"subtask_results": subtask_results}
+def _route_after_validation(state: AgentState) -> str:
+    verdict = state.get("validation", {})
+    if not verdict.get("approved", True) and state.get("revision_count", 0) < MAX_REVISIONS:
+        return "reasoning"
+    return "memory"
 
 
-def synthesize(state: QueryState) -> dict:
-    context_blocks = []
-    all_sources = []
-    for result in state["subtask_results"]:
-        for chunk in result["chunks"]:
-            page_label = f", p.{chunk['page'] + 1}" if chunk["page"] is not None else ""
-            label = f"{chunk['source']}{page_label}"
-            all_sources.append(label)
-            context_blocks.append(f"[{label}]\n{chunk['text']}")
-
-    context = "\n\n".join(context_blocks)
-    user_message = (
-        f"Original question: {state['question']}\n\n"
-        f"Context excerpts:\n\n{context}"
-    )
-
-    llm = get_llm()
-    response = llm.invoke(
-        [
-            {"role": "system", "content": SYNTHESIZE_SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ]
-    )
-
-    # De-duplicate sources while preserving first-seen order, for a clean
-    # "Sources:" footer.
-    seen = set()
-    unique_sources = []
-    for label in all_sources:
-        if label not in seen:
-            seen.add(label)
-            unique_sources.append(label)
-
-    return {"answer": response.content, "sources": unique_sources}
-
-
-# --- Graph assembly ----------------------------------------------------
+# --- Graph assembly ------------------------------------------------------
 
 
 def build_graph():
     from langgraph.graph import END, START, StateGraph
 
-    builder = StateGraph(QueryState)
-    builder.add_node("decompose", decompose)
-    builder.add_node("retrieve", retrieve)
-    builder.add_node("synthesize", synthesize)
+    builder = StateGraph(AgentState)
+    builder.add_node("planner", _planner_node)
+    builder.add_node("retrieval", _retrieval_node)
+    builder.add_node("reasoning", _reasoning_node)
+    # Named "validator", not "validation" -- that name is taken by the
+    # `validation` state field (the verdict dict), and LangGraph raises
+    # "'validation' is already being used as a state key" if a node reuses it.
+    builder.add_node("validator", _validation_node)
+    builder.add_node("memory", _memory_node)
 
-    builder.add_edge(START, "decompose")
-    builder.add_edge("decompose", "retrieve")
-    builder.add_edge("retrieve", "synthesize")
-    builder.add_edge("synthesize", END)
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "retrieval")
+    builder.add_edge("retrieval", "reasoning")
+    builder.add_edge("reasoning", "validator")
+    builder.add_conditional_edges(
+        "validator", _route_after_validation, {"reasoning": "reasoning", "memory": "memory"}
+    )
+    builder.add_edge("memory", END)
 
     return builder.compile()
 
 
-def answer_question(question: str) -> QueryState:
-    """Run the full orchestrator graph on a single question."""
+def answer_question(
+    question: str, conversation_history: Optional[List[dict]] = None
+) -> AgentState:
+    """Run the full multi-agent graph on a single question.
+
+    `conversation_history` is a list of {"question", "answer"} dicts from
+    earlier turns in the same session (see run_query.py) -- pass the
+    updated `conversation_history` this returns into the next call to
+    keep short-term memory going across a conversation.
+    """
     graph = build_graph()
     return graph.invoke(
         {
             "question": question,
-            "subtasks": [],
+            "conversation_history": conversation_history or [],
+            "plan": [],
             "subtask_results": [],
+            "draft_answer": "",
+            "validation": {},
+            "revision_count": 0,
             "answer": "",
             "sources": [],
+            "trace": [],
         }
     )

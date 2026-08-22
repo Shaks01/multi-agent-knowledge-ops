@@ -39,43 +39,65 @@ only once its code runs and its output has been looked at, not just written.
   retrieves for a query, with source file, page number, and similarity
   score — retrieval quality inspected directly, before any LLM is involved.
 
-## Phase 4+5 — RAG query answering + LangGraph orchestration (this commit)
+## Phase 4 — RAG query answering (superseded by Phase 5, see below)
 
-Built together as one feature: **Complex Query Handling** — a business
-user asks a question that may require reasoning across more than one
-document, and gets back one coherent, cited answer instead of a raw
-single-pass retrieval.
+First version: a single LangGraph orchestrator node that decomposed a
+question, retrieved per subtask, and synthesized one cited answer. Proved
+that "decompose -> retrieve -> synthesize" works end to end (see git
+history if you want the simpler 3-node version). Phase 5 replaced that
+single node with five distinct agents; the underlying decompose/retrieve/
+synthesize logic didn't disappear, it just moved into separate,
+independently-inspectable agents.
 
-- `src/knowledge_ops/orchestration/graph.py` is a LangGraph `StateGraph`
-  with three nodes, run in sequence:
-  1. **decompose** — an LLM call (structured output, not string-parsing)
-     breaks the question into 1-5 self-contained subtasks. A simple,
-     single-topic question just comes back as one subtask, unchanged.
-  2. **retrieve** — runs a Chroma similarity search (Phase 3) per subtask,
-     so a question spanning multiple policies actually pulls chunks from
-     each relevant document rather than just whatever's closest to the
-     question as a whole.
-  3. **synthesize** — one LLM call answers the *original* question using
-     only the retrieved chunks, citing the source document and page for
-     every claim, and says so explicitly if the context doesn't cover
-     part of the question rather than guessing.
-- `run_query.py` runs the graph and prints every step: the subtask
-  breakdown, what was retrieved for each one, and the final cited answer
-  — the orchestration equivalent of Phase 1's "print the prompt and the
-  response," extended to a multi-step agent.
-- Deliberately a straight-line graph, not a looping/self-correcting one —
-  that's the smallest orchestrator that satisfies "decompose, retrieve,
-  synthesize." Natural next steps once this is proven out: fan the
-  retrieve step out in parallel per subtask, add a router that skips
-  decomposition for obviously-simple questions, or add a critique node
-  that checks the answer against its cited context before returning it.
+## Phase 5 — Multi-agent architecture (this commit)
+
+Feature: **Multi-Agent Task Routing** — instead of one orchestrator doing
+everything, five agents each own one clearly scoped job, wired together
+by a LangGraph graph (`src/knowledge_ops/orchestration/graph.py`):
+
+- **Planning agent** (`agents/planner.py`) — the only agent that decides
+  *what* needs to happen. Breaks the question into an ordered plan of
+  subtasks (or a one-step plan, for a simple question).
+- **Retrieval agent** (`agents/retrieval.py`) — fetches chunks from Chroma
+  per subtask. Doesn't interpret anything.
+- **Reasoning agent** (`agents/reasoning.py`) — drafts one coherent, cited
+  answer to the *original* question from the retrieved context. Also the
+  agent that revises its own draft if validation rejects it.
+- **Validation agent** (`agents/validation.py`) — checks the draft's
+  claims are actually grounded in the retrieved context (not outside
+  knowledge, not the validator's own opinion). If it finds unsupported
+  claims, the graph routes back to the Reasoning agent once
+  (`config.MAX_REVISIONS`) with that specific feedback before returning
+  an answer regardless — bounded so a genuinely unanswerable question
+  can't loop forever.
+- **Memory agent** (`agents/memory.py`) — two jobs: keeps the running
+  (question, answer) history for the current session so follow-up
+  questions can reference earlier ones, and persists every run's full
+  step-by-step trace to `logs/agent_trace.jsonl` for later inspection.
+
+Because each agent returns its own step into an additive `trace` list
+(`agents/trace.py`), and `run_query.py` prints each agent's work as it
+happens, every interaction is inspectable both live (console) and after
+the fact (the JSONL log) — this is most of what Phase 6 below would have
+built from scratch; Phase 6 now mainly adds *aggregating and visualizing*
+what's already being logged, not the logging itself.
+
+Deliberately still a bounded, mostly-linear graph (one conditional retry
+edge), not a fully autonomous multi-agent system with arbitrary looping —
+that's the smallest version of "distinct agents with routing between
+them" that satisfies the acceptance criteria. Natural next steps: fan
+retrieval out in parallel per subtask, add a router that skips planning
+entirely for obviously-simple questions, or let the Validation agent's
+feedback loop apply to specific subtasks rather than the whole answer.
 
 ## Phase 6 — Transparency & observability
 
-- Structured logging of every step: what was retrieved, what prompt was
-  sent, what the model returned, how long it took, token usage.
-- Likely LangSmith (or an equivalent open tracer) so a full run can be
-  replayed and inspected, not just the final answer.
+- Phase 5's `logs/agent_trace.jsonl` already gives a durable, structured
+  record of every agent's inputs/outputs per run. What's still open:
+  latency and token-usage metrics per agent, a way to browse/search past
+  runs instead of grepping a JSONL file by hand, and likely LangSmith (or
+  an equivalent open tracer) for a proper visual replay of a run's graph
+  execution.
 
 ## Phase 7 — AI governance & guardrails
 
