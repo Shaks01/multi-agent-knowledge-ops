@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 # Load variables from a .env file in the project root, if present.
 load_dotenv()
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 
 # Gemini's stable, generally-available text embedding model. (There's a
 # newer "gemini-embedding-2" multimodal model too, but its embedding space
