@@ -1,9 +1,11 @@
 """
 Memory agent.
 
-Role: the only agent responsible for *remembering things across time*.
-Two distinct kinds of memory, both handled here so no other agent needs
-to know about either:
+Role: the only agent responsible for *remembering things across time*, and
+the last stop before an answer is handed back -- which makes it the right
+place to attach a low-confidence warning if the Validation agent's verdict
+never got approved (see `_flag_if_unapproved` below). Three jobs, all
+handled here so no other agent needs to know about any of them:
 
 1. Short-term conversational memory -- the running list of (question,
    answer) pairs for the current interactive session, so a follow-up
@@ -17,13 +19,24 @@ to know about either:
    past interaction can be inspected later without having had the
    terminal output open at the time. This is what satisfies "agent
    interactions are traceable and logged for inspection."
+
+3. Grounding warning -- by the time this agent runs, the Validator ->
+   Reasoning retry loop (graph.py) is over, one way or another: either the
+   Validation agent approved the draft, or the retry cap
+   (config.MAX_REVISIONS) was hit while it was still unapproved. This
+   agent is what actually acts on that: if the final verdict is still
+   unapproved, it prepends a plain-text warning -- naming the specific
+   unsupported claim(s) -- to the answer the user sees, rather than
+   handing back an answer that looked no different from a fully grounded
+   one. Nothing is redacted or blocked; see ROADMAP.md Phase 7 for
+   stricter enforcement (e.g. refusing outright) as a possible next step.
 """
 
 import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from knowledge_ops.agents.trace import log_step
 from knowledge_ops.config import LOGS_DIR
@@ -32,6 +45,26 @@ AGENT_NAME = "memory"
 
 TRACE_LOG_PATH = LOGS_DIR / "agent_trace.jsonl"
 
+UNVERIFIED_WARNING_HEADER = (
+    "NOTE: This answer could not be fully verified against the source "
+    "documents. Treat it with caution and check the underlying policies "
+    "directly before relying on it."
+)
+
+
+def _flag_if_unapproved(answer: str, validation: Optional[dict]) -> str:
+    validation = validation or {}
+    if validation.get("approved", True):
+        return answer
+
+    lines = [UNVERIFIED_WARNING_HEADER]
+    issues = validation.get("issues") or []
+    if issues:
+        lines.append("Unsupported claim(s) flagged by the validation agent:")
+        lines.extend(f"  - {issue}" for issue in issues)
+
+    return "\n".join(lines) + "\n\n" + answer
+
 
 def run(
     question: str,
@@ -39,13 +72,18 @@ def run(
     sources: List[str],
     trace: List[dict],
     conversation_history: List[dict],
+    validation: Optional[dict] = None,
 ) -> dict:
+    final_answer = _flag_if_unapproved(answer, validation)
+    was_flagged = final_answer != answer
+
     run_id = uuid.uuid4().hex[:12]
     record = {
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "question": question,
-        "answer": answer,
+        "answer": final_answer,
+        "flagged_low_confidence": was_flagged,
         "sources": sources,
         "trace": trace,
     }
@@ -54,16 +92,24 @@ def run(
     with open(TRACE_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
-    updated_history = conversation_history + [{"question": question, "answer": answer}]
+    updated_history = conversation_history + [
+        {"question": question, "answer": final_answer}
+    ]
 
+    if was_flagged:
+        print(f"--- {AGENT_NAME} agent: flagged answer as low-confidence ---")
     print(f"--- {AGENT_NAME} agent: logged run {run_id} to {TRACE_LOG_PATH} ---\n")
 
     return {
-        "answer": answer,
+        "answer": final_answer,
         "conversation_history": updated_history,
         "trace": log_step(
             AGENT_NAME,
             "persist_trace",
-            output={"run_id": run_id, "log_path": str(TRACE_LOG_PATH)},
+            output={
+                "run_id": run_id,
+                "log_path": str(TRACE_LOG_PATH),
+                "flagged_low_confidence": was_flagged,
+            },
         ),
     }

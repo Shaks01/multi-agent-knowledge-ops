@@ -8,7 +8,9 @@ graph, each with one clearly scoped job:
   retrieval  -> fetches context per subtask from Chroma
   reasoning  -> drafts a coherent, cited answer from that context
   validation -> checks the draft is actually grounded in that context
-  memory     -> persists the run's full trace and updates conversation history
+  memory     -> persists the run's full trace, updates conversation history,
+                and prepends a low-confidence warning to the answer if the
+                final validation verdict was never approved
 
 Graph shape:
 
@@ -92,6 +94,7 @@ def _memory_node(state: AgentState) -> dict:
         sources=state["sources"],
         trace=state["trace"],
         conversation_history=state.get("conversation_history", []),
+        validation=state.get("validation"),
     )
 
 
