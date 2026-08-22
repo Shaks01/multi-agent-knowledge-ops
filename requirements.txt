@@ -3,18 +3,22 @@ langchain>=0.3,<0.4
 langchain-google-genai>=2.0,<3.0
 python-dotenv>=1.0,<2.0
 
+# Phase 2: document loading & splitting
+langchain-community>=0.3,<0.4
+langchain-text-splitters>=0.3,<0.4
+pypdf>=5.0            # backs PyPDFLoader
+
+# Phase 3: embeddings + Chroma vector store
+langchain-chroma>=0.2,<0.3
+chromadb>=0.5
+
+# Phase 4+5: query decomposition + orchestration ("Complex Query Handling")
+langgraph>=0.2,<0.3
+
 # --- Add these when you reach the phase that needs them (see ROADMAP.md) ---
 
-# Phase 2: document loading & splitting
-# unstructured>=0.15
-# markdown>=3.6
-
-# Phase 3-4: embeddings, Chroma vector store, RAG
-# langchain-chroma>=0.1
-# chromadb>=0.5
-
-# Phase 5: multi-agent orchestration
-# langgraph>=0.2
+# Phase 2 (later): more document types
+# docx2txt>=0.8        # backs Docx2txtLoader for .docx contracts/policies
 
 # Phase 6: observability
 # langsmith>=0.1
