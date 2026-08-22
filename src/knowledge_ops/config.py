@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 # Load variables from a .env file in the project root, if present.
 load_dotenv()
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 
 # Gemini's stable, generally-available text embedding model. (There's a
 # newer "gemini-embedding-2" multimodal model too, but its embedding space
@@ -70,6 +70,19 @@ MAX_REVISIONS = int(os.environ.get("MAX_REVISIONS", "1"))
 # (logs/agent_trace.jsonl). Git-ignored -- it's local operational history,
 # not project source.
 LOGS_DIR = PROJECT_ROOT / "logs"
+
+# --- Guardrails (Phase 6+7: explainability + governance) -----------------
+
+# Input Guard agent: reject questions longer than this outright, before
+# any LLM call is made.
+MAX_QUESTION_LENGTH = int(os.environ.get("MAX_QUESTION_LENGTH", "2000"))
+
+# Validation agent: an answer is treated as low-confidence -- and gets the
+# same "unverified" warning as an outright rejection -- if the validator's
+# self-reported confidence falls below this, even when it also said
+# `approved: True`. Tune down if too many fine answers get flagged, up if
+# clearly shaky ones aren't.
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.7"))
 
 
 def _require_api_key() -> str:

@@ -90,22 +90,65 @@ retrieval out in parallel per subtask, add a router that skips planning
 entirely for obviously-simple questions, or let the Validation agent's
 feedback loop apply to specific subtasks rather than the whole answer.
 
-## Phase 6 — Transparency & observability
+## Phase 6 — Explainability & transparency (this commit)
 
-- Phase 5's `logs/agent_trace.jsonl` already gives a durable, structured
-  record of every agent's inputs/outputs per run. What's still open:
-  latency and token-usage metrics per agent, a way to browse/search past
-  runs instead of grepping a JSONL file by hand, and likely LangSmith (or
-  an equivalent open tracer) for a proper visual replay of a run's graph
-  execution.
+Feature: **Explainability and Transparency** — turning the raw trace
+Phase 5 already logs into something a person can actually use to
+understand and evaluate a decision, not just data sitting in a file.
 
-## Phase 7 — AI governance & guardrails
+- `src/knowledge_ops/explainability/report.py` + `run_explain.py`: given a
+  `run_id` (or nothing, for the most recent run), reads the matching
+  record from `logs/agent_trace.jsonl` and renders a plain-text
+  walkthrough -- every agent's step, the final answer, its sources,
+  whether it was blocked or flagged, all in one place instead of scrolled
+  past in a terminal or buried in raw JSON.
+- **Citation consistency check** (`check_citation_consistency`): extracts
+  every `(Source: ...)` citation from the final answer and checks it
+  against what the Retrieval agent actually returned for that run. A
+  citation naming a document that was never retrieved is flagged as a
+  likely hallucinated source -- this is the concrete, checkable version of
+  "the explanation aligns with the final response and source documents,"
+  not just an assertion that it does.
+- `run_query.py` now points to `run_explain.py` after every answer, so the
+  live console trace and the after-the-fact report are both one command
+  away.
 
-- Input/output filtering, source-grounding checks (does the answer actually
-  cite retrieved content?), rate limiting, and an audit log of every query
-  and answer.
-- A short written policy: what the agent is and isn't allowed to answer,
-  and what happens when it's unsure.
+What's still open: latency/token-usage metrics per agent, a way to
+browse/search many past runs at once instead of one at a time, and likely
+LangSmith (or an equivalent open tracer) for a visual replay of a run's
+graph execution rather than a text report.
+
+## Phase 7 — AI governance & guardrails (this commit)
+
+Feature: **Governance and Guardrails** — minimizing hallucinations and
+handling uncertainty responsibly, plus a first line of defense against
+malicious or malformed input.
+
+- **Input Guard agent** (`agents/input_guard.py`) — new first node in the
+  graph (`START -> input_guard`). Rule-based, not an LLM call: rejects
+  empty input, input over `config.MAX_QUESTION_LENGTH`, and common
+  prompt-injection phrasing ("ignore previous instructions," "reveal your
+  system prompt," etc.) before any other agent -- including the
+  LLM-backed ones -- ever sees the question. Deliberately simple and
+  deterministic over a fancier LLM-based moderation layer, so every
+  rejection is fully explainable by pointing at the rule that fired.
+- **Confidence threshold** (`config.CONFIDENCE_THRESHOLD`, default 0.7) —
+  the Validation agent (Phase 5) now also rates its confidence 0.0-1.0,
+  not just approved/rejected. An approved answer built on thin or
+  borderline context, not just an outright rejected one, now triggers the
+  same retry-then-warn path if its confidence falls below the threshold.
+- **Warnings and disclaimers** (`agents/memory.py`) — carried over from
+  the "Response Validation" work and extended: a low-confidence or
+  rejected answer gets a visible warning naming the specific unsupported
+  claim(s), and every non-blocked answer gets a standing disclaimer
+  naming what it was generated from and that it isn't legal advice. Both
+  the warning and the disclaimer are logged, not just displayed, so
+  they're part of the auditable record too.
+
+Deliberately not yet doing: semantic/LLM-based content moderation (only
+pattern-based), automatic escalation to a human for low-confidence
+answers, or hard-blocking (vs. warning on) ungrounded answers -- see
+`config.py` and the agents above for where each of those would plug in.
 
 ## Ground rules for every phase
 

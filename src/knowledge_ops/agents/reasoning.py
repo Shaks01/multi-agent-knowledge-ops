@@ -61,12 +61,30 @@ def run(
     if history_block:
         parts.append(history_block)
     parts.append(f"Original question: {question}")
-    if validation_feedback and validation_feedback.get("issues"):
-        issues = "\n".join(f"- {issue}" for issue in validation_feedback["issues"])
-        parts.append(
-            "Your previous draft answer had issues flagged by the "
-            f"validation agent -- fix these specifically:\n{issues}"
-        )
+    if validation_feedback:
+        issues = validation_feedback.get("issues")
+        if issues:
+            issues_block = "\n".join(f"- {issue}" for issue in issues)
+            parts.append(
+                "Your previous draft answer had issues flagged by the "
+                f"validation agent -- fix these specifically:\n{issues_block}"
+            )
+        else:
+            # Approved, but the validation agent's confidence in the
+            # grounding was still below the threshold, with no single
+            # claim specific enough to call out. Give the model something
+            # actionable anyway, rather than silently asking it to just
+            # try again.
+            confidence = validation_feedback.get("confidence")
+            parts.append(
+                "Your previous draft answer was approved, but the "
+                f"validation agent's confidence in its grounding was only "
+                f"{confidence:.2f} (below the required threshold), without "
+                "a single specific unsupported claim to point to. Review "
+                "the context again and tighten or remove anything that is "
+                "only loosely or indirectly supported, so the final answer "
+                "is more clearly and directly grounded."
+            )
     parts.append(f"Context excerpts:\n\n{context}")
     user_message = "\n\n".join(parts)
 
@@ -78,7 +96,11 @@ def run(
         ]
     )
 
-    is_revision = bool(validation_feedback and validation_feedback.get("issues"))
+    # A revision is any call made *because* a prior validation verdict
+    # exists (regardless of whether it listed specific issues) -- this is
+    # what makes config.MAX_REVISIONS actually bound the low-confidence
+    # retry path in graph.py, not just the outright-rejected one.
+    is_revision = bool(validation_feedback)
     label = "revised draft" if is_revision else "draft"
     print(f"--- {AGENT_NAME} agent: {label} answer ---")
     print(response.content)

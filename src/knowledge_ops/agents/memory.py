@@ -3,9 +3,8 @@ Memory agent.
 
 Role: the only agent responsible for *remembering things across time*, and
 the last stop before an answer is handed back -- which makes it the right
-place to attach a low-confidence warning if the Validation agent's verdict
-never got approved (see `_flag_if_unapproved` below). Three jobs, all
-handled here so no other agent needs to know about any of them:
+place to attach warnings/disclaimers and record what happened. Four jobs,
+all handled here so no other agent needs to know about any of them:
 
 1. Short-term conversational memory -- the running list of (question,
    answer) pairs for the current interactive session, so a follow-up
@@ -17,19 +16,28 @@ handled here so no other agent needs to know about any of them:
    run's `trace` as it works; this agent is what actually commits that
    trace to disk (logs/agent_trace.jsonl, one JSON object per run) so a
    past interaction can be inspected later without having had the
-   terminal output open at the time. This is what satisfies "agent
-   interactions are traceable and logged for inspection."
+   terminal output open at the time (see run_explain.py). This is what
+   satisfies "agent interactions are traceable and logged for inspection."
 
-3. Grounding warning -- by the time this agent runs, the Validator ->
-   Reasoning retry loop (graph.py) is over, one way or another: either the
-   Validation agent approved the draft, or the retry cap
-   (config.MAX_REVISIONS) was hit while it was still unapproved. This
-   agent is what actually acts on that: if the final verdict is still
-   unapproved, it prepends a plain-text warning -- naming the specific
-   unsupported claim(s) -- to the answer the user sees, rather than
-   handing back an answer that looked no different from a fully grounded
-   one. Nothing is redacted or blocked; see ROADMAP.md Phase 7 for
-   stricter enforcement (e.g. refusing outright) as a possible next step.
+3. Grounding/confidence warning -- by the time this agent runs, the
+   Validator -> Reasoning retry loop (graph.py) is over, one way or
+   another. If the final verdict is still unapproved OR its confidence is
+   below config.CONFIDENCE_THRESHOLD, this agent prepends a plain-text
+   warning -- naming the specific unsupported claim(s) -- rather than
+   handing back an answer that looks no different from a fully grounded
+   one. Nothing is redacted; see ROADMAP.md Phase 7 for stricter
+   enforcement (e.g. refusing outright) as a possible next step.
+
+4. Standing disclaimer -- every non-blocked answer gets a short, constant
+   footer naming what it was generated from and that it isn't a
+   substitute for checking the real policy. This is separate from #3:
+   it's not conditional on anything going wrong, it's baseline source
+   attribution for *any* answer this system produces.
+
+A question rejected by the Input Guard agent (graph.py routes straight
+here in that case) skips #3 and #4 entirely -- a "your question wasn't
+processed" message doesn't need a grounding disclaimer, since nothing was
+generated from the documents.
 """
 
 import json
@@ -39,7 +47,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from knowledge_ops.agents.trace import log_step
-from knowledge_ops.config import LOGS_DIR
+from knowledge_ops.config import CONFIDENCE_THRESHOLD, LOGS_DIR
 
 AGENT_NAME = "memory"
 
@@ -51,17 +59,35 @@ UNVERIFIED_WARNING_HEADER = (
     "directly before relying on it."
 )
 
+STANDING_DISCLAIMER = (
+    "This answer was generated from the company policy documents in this "
+    "system's knowledge base and is provided for informational purposes "
+    "only -- it is not legal advice. Confirm with HR/Legal before relying "
+    "on it for an actual decision."
+)
 
-def _flag_if_unapproved(answer: str, validation: Optional[dict]) -> str:
-    validation = validation or {}
-    if validation.get("approved", True):
+
+def _needs_grounding_warning(validation: Optional[dict]) -> bool:
+    if not validation:
+        return False
+    if not validation.get("approved", True):
+        return True
+    confidence = validation.get("confidence")
+    return confidence is not None and confidence < CONFIDENCE_THRESHOLD
+
+
+def _apply_grounding_warning(answer: str, validation: Optional[dict]) -> str:
+    if not _needs_grounding_warning(validation):
         return answer
 
     lines = [UNVERIFIED_WARNING_HEADER]
-    issues = validation.get("issues") or []
+    issues = (validation or {}).get("issues") or []
     if issues:
         lines.append("Unsupported claim(s) flagged by the validation agent:")
         lines.extend(f"  - {issue}" for issue in issues)
+    confidence = (validation or {}).get("confidence")
+    if confidence is not None:
+        lines.append(f"(validation confidence: {confidence:.2f})")
 
     return "\n".join(lines) + "\n\n" + answer
 
@@ -73,9 +99,17 @@ def run(
     trace: List[dict],
     conversation_history: List[dict],
     validation: Optional[dict] = None,
+    guard: Optional[dict] = None,
 ) -> dict:
-    final_answer = _flag_if_unapproved(answer, validation)
-    was_flagged = final_answer != answer
+    blocked = bool(guard) and not guard.get("allowed", True)
+
+    if blocked:
+        final_answer = answer  # the Input Guard agent already set this to its reason
+        was_flagged = False
+    else:
+        final_answer = _apply_grounding_warning(answer, validation)
+        was_flagged = final_answer != answer
+        final_answer = final_answer + "\n\n" + STANDING_DISCLAIMER
 
     run_id = uuid.uuid4().hex[:12]
     record = {
@@ -83,6 +117,8 @@ def run(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "question": question,
         "answer": final_answer,
+        "blocked_by_input_guard": blocked,
+        "guard_category": (guard or {}).get("category"),
         "flagged_low_confidence": was_flagged,
         "sources": sources,
         "trace": trace,
@@ -96,7 +132,9 @@ def run(
         {"question": question, "answer": final_answer}
     ]
 
-    if was_flagged:
+    if blocked:
+        print(f"--- {AGENT_NAME} agent: question was blocked, not answered ---")
+    elif was_flagged:
         print(f"--- {AGENT_NAME} agent: flagged answer as low-confidence ---")
     print(f"--- {AGENT_NAME} agent: logged run {run_id} to {TRACE_LOG_PATH} ---\n")
 
@@ -109,6 +147,7 @@ def run(
             output={
                 "run_id": run_id,
                 "log_path": str(TRACE_LOG_PATH),
+                "blocked_by_input_guard": blocked,
                 "flagged_low_confidence": was_flagged,
             },
         ),

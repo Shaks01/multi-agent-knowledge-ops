@@ -1,23 +1,31 @@
 """
-Phase 5: the multi-agent orchestrator.
+Phase 5+6+7: the multi-agent orchestrator, now with a guardrail entry
+point.
 
-Wires five distinct agents (src/knowledge_ops/agents/) into a LangGraph
+Wires six distinct agents (src/knowledge_ops/agents/) into a LangGraph
 graph, each with one clearly scoped job:
 
-  planner    -> decides the sequence of subtasks needed (routing/planning)
-  retrieval  -> fetches context per subtask from Chroma
-  reasoning  -> drafts a coherent, cited answer from that context
-  validation -> checks the draft is actually grounded in that context
-  memory     -> persists the run's full trace, updates conversation history,
-                and prepends a low-confidence warning to the answer if the
-                final validation verdict was never approved
+  input_guard -> rule-based safety/sanity check, before anything else runs
+  planner     -> decides the sequence of subtasks needed (routing/planning)
+  retrieval   -> fetches context per subtask from Chroma
+  reasoning   -> drafts a coherent, cited answer from that context
+  validation  -> checks the draft is grounded in that context, with a
+                 confidence score
+  memory      -> persists the run's full trace, updates conversation
+                 history, and applies warnings/disclaimers to the answer
 
 Graph shape:
 
-    START -> planner -> retrieval -> reasoning -> validator --+
+    START -> input_guard --(blocked)-------------------+
+                 |                                      |
+              (allowed)                                 |
+                 v                                       v
+              planner -> retrieval -> reasoning -> validator --+
                                           ^                    |
-                                          | (rejected, retry)  | (approved, or
-                                          +--------------------+  retry cap hit)
+                                          | (rejected or       | (approved &
+                                          |  low confidence,   |  confident, or
+                                          |  retry)            |  retry cap hit)
+                                          +--------------------+
                                                                v
                                                              memory -> END
 
@@ -26,23 +34,38 @@ node name that collides with a state field name, and `validation` is
 already the state field holding the verdict dict.)
 
 The validator -> reasoning edge is a bounded retry (see
-config.MAX_REVISIONS): if the validator finds unsupported claims, the
-Reasoning agent gets one more attempt with that specific feedback before
-the answer is returned regardless, so a genuinely unanswerable question
-can't loop forever.
+config.MAX_REVISIONS): if the validator finds unsupported claims OR its
+confidence is below config.CONFIDENCE_THRESHOLD, the Reasoning agent gets
+one more attempt with that specific feedback before the answer is
+returned regardless, so a genuinely unanswerable question can't loop
+forever. The Memory agent applies a visible warning in that case (or if
+the retry cap was hit before the Validation agent was satisfied) -- see
+agents/memory.py.
+
+A question the Input Guard agent blocks skips planner/retrieval/
+reasoning/validator entirely and goes straight to Memory, which logs the
+rejection and returns its reason as the answer, unchanged.
 """
 
 import operator
 from typing import Annotated, List, Optional, TypedDict
 
-from knowledge_ops.agents import memory, planner, reasoning, retrieval, validation
+from knowledge_ops.agents import (
+    input_guard,
+    memory,
+    planner,
+    reasoning,
+    retrieval,
+    validation,
+)
 from knowledge_ops.agents.retrieval import SubtaskResult
-from knowledge_ops.config import MAX_REVISIONS
+from knowledge_ops.config import CONFIDENCE_THRESHOLD, MAX_REVISIONS
 
 
 class AgentState(TypedDict):
     question: str
     conversation_history: List[dict]
+    guard: dict
     plan: List[str]
     subtask_results: List[SubtaskResult]
     draft_answer: str
@@ -59,6 +82,10 @@ class AgentState(TypedDict):
 # Thin adapters between LangGraph's "one dict argument" node signature and
 # each agent's own plain-argument function signature (kept plain so each
 # agent module is usable/testable on its own, without a graph involved).
+
+
+def _input_guard_node(state: AgentState) -> dict:
+    return input_guard.run(state["question"])
 
 
 def _planner_node(state: AgentState) -> dict:
@@ -95,12 +122,20 @@ def _memory_node(state: AgentState) -> dict:
         trace=state["trace"],
         conversation_history=state.get("conversation_history", []),
         validation=state.get("validation"),
+        guard=state.get("guard"),
     )
+
+
+def _route_after_guard(state: AgentState) -> str:
+    guard = state.get("guard", {})
+    return "planner" if guard.get("allowed", True) else "memory"
 
 
 def _route_after_validation(state: AgentState) -> str:
     verdict = state.get("validation", {})
-    if not verdict.get("approved", True) and state.get("revision_count", 0) < MAX_REVISIONS:
+    rejected = not verdict.get("approved", True)
+    low_confidence = verdict.get("confidence", 1.0) < CONFIDENCE_THRESHOLD
+    if (rejected or low_confidence) and state.get("revision_count", 0) < MAX_REVISIONS:
         return "reasoning"
     return "memory"
 
@@ -112,6 +147,7 @@ def build_graph():
     from langgraph.graph import END, START, StateGraph
 
     builder = StateGraph(AgentState)
+    builder.add_node("input_guard", _input_guard_node)
     builder.add_node("planner", _planner_node)
     builder.add_node("retrieval", _retrieval_node)
     builder.add_node("reasoning", _reasoning_node)
@@ -121,7 +157,10 @@ def build_graph():
     builder.add_node("validator", _validation_node)
     builder.add_node("memory", _memory_node)
 
-    builder.add_edge(START, "planner")
+    builder.add_edge(START, "input_guard")
+    builder.add_conditional_edges(
+        "input_guard", _route_after_guard, {"planner": "planner", "memory": "memory"}
+    )
     builder.add_edge("planner", "retrieval")
     builder.add_edge("retrieval", "reasoning")
     builder.add_edge("reasoning", "validator")
@@ -148,6 +187,7 @@ def answer_question(
         {
             "question": question,
             "conversation_history": conversation_history or [],
+            "guard": {},
             "plan": [],
             "subtask_results": [],
             "draft_answer": "",
